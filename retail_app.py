@@ -16,7 +16,7 @@ def load_data():
     # 读取原始数据
     # data_path = '/Users/yuanhaowen/BB project/combined_data_202301.xlsx'
     # data = pd.read_excel(data_path)
-    data_url = "https://retailproject2024.blob.core.windows.net/retaildata/combined_data_202301.xlsx?sv=2022-11-02&ss=bfqt&srt=co&sp=rtfx&se=2025-11-13T10:49:04Z&st=2024-11-13T02:49:04Z&spr=https&sig=T8Y0dAHVRz7h6lyFuCVGp3%2FixKM8KTKy%2FDV9XxIz9bY%3D"
+    data_url = "https://retailproject2024.blob.core.windows.net/retaildata/combined_data_202301.csv?sv=2022-11-02&ss=bfqt&srt=co&sp=rtfx&se=2025-11-13T10:49:04Z&st=2024-11-13T02:49:04Z&spr=https&sig=T8Y0dAHVRz7h6lyFuCVGp3%2FixKM8KTKy%2FDV9XxIz9bY%3D"
     data = pd.read_excel(data_url)
 
     # 处理日期和数据格式
