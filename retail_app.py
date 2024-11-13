@@ -340,7 +340,7 @@ with tabs[3]:
         rfm['RFM_Score'] = rfm['R_Score'].astype(int) + rfm['F_Score'].astype(int) + rfm['M_Score'].astype(int)
 
         # 在 Streamlit 中显示 RFM 数据的头几行，去除 Latitude 和 Longitude 列
-        st.write("RFM Table:", rfm.drop(columns=['Latitude', 'Longitude']))
+        # st.write("RFM Table:", rfm.drop(columns=['Latitude', 'Longitude']))
 
         # 绘制 RFM 分数的分布直方图
         fig, ax = plt.subplots(figsize=(10, 6))
