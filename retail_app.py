@@ -1,396 +1,580 @@
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import matplotlib.dates as mdates
 import plotly.express as px
 from scipy.stats import chi2_contingency
-import numpy as np
+
+from data_pipeline import (
+    load_and_prepare_data,
+    compute_highlights,
+    generate_data_quality_report,
+    build_promotion_summary,
+    build_profitability_by_store,
+    build_monthly_sales_series,
+    build_cohort_retention,
+)
+
+
+st.set_page_config(page_title="Retail Sales Intelligence", layout="wide")
+
+
+def quantile_rank_score(series: pd.Series, desired_bins: int = 5, reverse: bool = False) -> pd.Series:
+    """Assign quantile-based scores (1-desired_bins) with safe fallbacks for small datasets."""
+    if series.empty:
+        return pd.Series(dtype=int)
+
+    ranked = series.rank(method="first", ascending=not reverse)
+    unique_values = ranked.nunique()
+    num_bins = min(desired_bins, unique_values)
+
+    if num_bins <= 1:
+        neutral_score = desired_bins // 2 + 1
+        return pd.Series(neutral_score, index=series.index, dtype=int)
+
+    bins = pd.qcut(ranked, num_bins, labels=False)
+    scores = bins + 1
+
+    if num_bins < desired_bins:
+        scores = np.ceil(scores * desired_bins / num_bins)
+
+    if reverse:
+        scores = desired_bins + 1 - scores
+
+    return scores.astype(int)
+
+
+def format_currency(value: float) -> str:
+    if value is None or np.isnan(value):
+        return "$0"
+    return f"${value:,.0f}"
+
+
+def format_percent(value: float) -> str:
+    if value is None or np.isnan(value):
+        return "0%"
+    return f"{value:.0%}"
+
 
 @st.cache_data
-def load_data():
-    # 读取经纬度数据并合并
-    # geo_data_path = '/Users/yuanhaowen/BB project/qc_cities_coordinates.csv'
-    # geo_data = pd.read_csv(geo_data_path)
-    geo_data_url = "https://retailproject2024.blob.core.windows.net/retaildata/qc_cities_coordinates.csv?sv=2022-11-02&ss=bfqt&srt=co&sp=rtfx&se=2025-11-13T10:49:04Z&st=2024-11-13T02:49:04Z&spr=https&sig=T8Y0dAHVRz7h6lyFuCVGp3%2FixKM8KTKy%2FDV9XxIz9bY%3D"
-    geo_data = pd.read_csv(geo_data_url)
-    # 读取原始数据
-    # data_path = '/Users/yuanhaowen/BB project/combined_data_202301.xlsx'
-    # data = pd.read_csv(data_path)
-    data_url = "https://retailproject2024.blob.core.windows.net/retaildata/combined_data_202301.csv?sv=2022-11-02&ss=bfqt&srt=co&sp=rtfx&se=2025-11-13T10:49:04Z&st=2024-11-13T02:49:04Z&spr=https&sig=T8Y0dAHVRz7h6lyFuCVGp3%2FixKM8KTKy%2FDV9XxIz9bY%3D"
-    data = pd.read_csv(data_url)
-
-    # 处理日期和数据格式
-    data['Date_transaction'] = pd.to_datetime(data['Date_transaction'], format='%Y%m%d')
-    data['Year'] = data['Date_transaction'].dt.year
-    data['Quarter'] = data['Date_transaction'].dt.quarter
-    data['Month'] = data['Date_transaction'].dt.month
-    data['Unit_sale_price'] = data['Unit_sale_price'].astype(str).str.replace(',', '.').astype(float)
-    data['Item_ID'] = data['Item_ID'].astype(str)  # 确保 Item_ID 是字符串类型
-    data['days_since_epoch'] = (data['Date_transaction'] - pd.Timestamp('1970-01-01')).dt.days
+def load_data() -> pd.DataFrame:
+    return load_and_prepare_data()
 
 
-    # 将原始数据和经纬度数据合并
-    merged_data = data.merge(geo_data, left_on='CITY', right_on='City', how='left')
-    merged_data.loc[merged_data['LIBELLE_y'].isin(['0902 Ecom Website - LVER Canada', '0904 Ecom Website - LVER USA']), 'CITY'] = 'Online'
+def apply_sidebar_filters(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    filtered = data.copy()
+    selections: dict = {}
 
-    return merged_data
+    st.sidebar.header("Filters")
+
+    years = sorted(filtered["Year"].dropna().unique())
+    selected_years = st.sidebar.multiselect("Year", options=years, format_func=lambda x: str(int(x)))
+    if selected_years:
+        filtered = filtered[filtered["Year"].isin(selected_years)]
+    selections["years"] = selected_years
+
+    quarters = sorted(filtered["Quarter"].dropna().unique())
+    selected_quarters = st.sidebar.multiselect("Quarter", options=quarters, format_func=lambda x: f"Q{int(x)}")
+    if selected_quarters:
+        filtered = filtered[filtered["Quarter"].isin(selected_quarters)]
+    selections["quarters"] = selected_quarters
+
+    months = sorted(filtered["Month"].dropna().unique())
+    selected_months = st.sidebar.multiselect("Month", options=months, format_func=lambda x: f"{int(x):02d}")
+    if selected_months:
+        filtered = filtered[filtered["Month"].isin(selected_months)]
+    selections["months"] = selected_months
+
+    days_series = data["days_since_epoch"].dropna().astype(int)
+    min_day = int(days_series.min()) if not days_series.empty else 0
+    max_day = int(days_series.max()) if not days_series.empty else 0
+
+    filtered_days = filtered["days_since_epoch"].dropna().astype(int)
+    default_start = int(filtered_days.min()) if not filtered_days.empty else min_day
+    default_end = int(filtered_days.max()) if not filtered_days.empty else max_day
+
+    epoch = pd.Timestamp("1970-01-01")
+    if min_day == max_day:
+        selected_days = (min_day, max_day)
+        st.sidebar.info("Only one day of data is available for the selected filters.")
+    else:
+        selected_days = st.sidebar.slider(
+            "Date range",
+            min_value=min_day,
+            max_value=max_day,
+            value=(default_start, default_end),
+        )
+
+    filtered = filtered[
+        (filtered["days_since_epoch"] >= selected_days[0])
+        & (filtered["days_since_epoch"] <= selected_days[1])
+    ]
+    start_date = (epoch + pd.to_timedelta(selected_days[0], unit="D")).strftime("%Y-%m-%d")
+    end_date = (epoch + pd.to_timedelta(selected_days[1], unit="D")).strftime("%Y-%m-%d")
+    st.sidebar.caption(f"Date range: {start_date} → {end_date}")
+    selections["days"] = (start_date, end_date)
+
+    categories = sorted(filtered["Catégorie"].dropna().unique())
+    selected_categories = st.sidebar.multiselect("Category", options=categories)
+    if selected_categories:
+        filtered = filtered[filtered["Catégorie"].isin(selected_categories)]
+    selections["categories"] = selected_categories
+
+    item_ids = sorted(filtered["Item_ID"].dropna().unique())
+    selected_items = st.sidebar.multiselect("Item ID", options=item_ids)
+    if selected_items:
+        filtered = filtered[filtered["Item_ID"].isin(selected_items)]
+    selections["items"] = selected_items
+
+    cities = sorted(filtered["CITY"].dropna().unique())
+    selected_cities = st.sidebar.multiselect("City", options=cities)
+    if selected_cities:
+        filtered = filtered[filtered["CITY"].isin(selected_cities)]
+    selections["cities"] = selected_cities
+
+    if selected_cities:
+        store_options = filtered[filtered["CITY"].isin(selected_cities)]["LIBELLE_y"].dropna().unique()
+    else:
+        store_options = filtered["LIBELLE_y"].dropna().unique()
+    store_options = sorted(store_options)
+
+    selected_stores = st.sidebar.multiselect("Store", options=store_options)
+    if selected_stores:
+        filtered = filtered[filtered["LIBELLE_y"].isin(selected_stores)]
+    selections["stores"] = selected_stores
+
+    return filtered, selections
+
+
+def render_kpi_summary(highlights: dict) -> None:
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Revenue", format_currency(highlights.get("total_revenue", 0.0)))
+    col2.metric("Orders", f"{highlights.get('total_orders', 0):,}")
+    col3.metric("Units Sold", f"{highlights.get('total_units', 0):,.0f}")
+    col4.metric("Avg. Order Value", format_currency(highlights.get("avg_order_value", 0.0)))
+
+    top_city = highlights.get("top_city")
+    share_online = highlights.get("online_share")
+
+    narrative_lines = []
+    if top_city:
+        city_name, city_revenue = top_city
+        narrative_lines.append(
+            f"**Top city:** {city_name} drives {format_currency(city_revenue)} in revenue for the selected period."
+        )
+    if share_online is not None:
+        narrative_lines.append(
+            f"**Digital share:** Online channels account for {format_percent(share_online)} of revenue."
+        )
+    if narrative_lines:
+        st.markdown("\n".join(f"- {line}" for line in narrative_lines))
 
 
 data = load_data()
-# 初始化 filtered_data 为 data 的副本
-filtered_data = data.copy()
-filtered_data = filtered_data[filtered_data['Quantity_item'] >= 0]
 
+filtered_data = data[data["Quantity_item"] >= 0].copy()
+filtered_data, selections = apply_sidebar_filters(filtered_data)
 
-tabs = st.tabs(["Sales Visualization", "Customer Analysis", "Transaction Value", "RFM Analysis"])
+transaction_level = (
+    filtered_data.drop_duplicates(subset="Transaction_ID") if not filtered_data.empty else pd.DataFrame()
+)
+highlights = compute_highlights(filtered_data)
+
+tabs = st.tabs(
+    [
+        "Sales Overview",
+        "Customer Insights",
+        "Transaction Value",
+        "RFM Analysis",
+        "Promotion Impact",
+        "Retention Cohorts",
+        "Data Quality",
+    ]
+)
+
 
 with tabs[0]:
-    # 筛选器
-    selected_years = st.sidebar.multiselect('Select Years:', options=sorted(data['Year'].unique().astype(str)))
-    if selected_years:
-        filtered_data = filtered_data[filtered_data['Year'].isin([int(year) for year in selected_years])]
+    st.header("Sales Overview")
 
-    selected_quarters = st.sidebar.multiselect('Select Quarters:', options=sorted(filtered_data['Quarter'].unique().astype(str)))
-    if selected_quarters:
-        filtered_data = filtered_data[filtered_data['Quarter'].isin([int(quarter) for quarter in selected_quarters])]
-
-    selected_months = st.sidebar.multiselect('Select Months:', options=sorted(filtered_data['Month'].unique().astype(str)))
-    if selected_months:
-        filtered_data = filtered_data[filtered_data['Month'].isin([int(month) for month in selected_months])]
-
-    # 日期范围选择器
-    min_day = filtered_data['days_since_epoch'].min()
-    max_day = filtered_data['days_since_epoch'].max()
-    selected_days = st.sidebar.slider('Select Date Range:', min_value=min_day, max_value=max_day, value=(min_day, max_day))
-    # 显示选择的日期范围
-    start_date = pd.Timestamp('1970-01-01') + pd.to_timedelta(selected_days[0], unit='D')
-    end_date = pd.Timestamp('1970-01-01') + pd.to_timedelta(selected_days[1], unit='D')
-    st.sidebar.write(f"Selected Date Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-
-    filtered_data = filtered_data[(filtered_data['days_since_epoch'] >= selected_days[0]) & (filtered_data['days_since_epoch'] <= selected_days[1])]
-
-
-    # 类别筛选器
-    selected_categories = st.sidebar.multiselect('Select Categories:', options=sorted(filtered_data['Catégorie'].dropna().unique()))
-    if selected_categories:
-        filtered_data = filtered_data[filtered_data['Catégorie'].isin(selected_categories)]
-
-    # 商品ID筛选器
-    selected_item_ids = st.sidebar.multiselect('Select Item IDs:', options=sorted(filtered_data['Item_ID'].unique()))
-    if selected_item_ids:
-        filtered_data = filtered_data[filtered_data['Item_ID'].isin(selected_item_ids)]
-
-    # 城市筛选器
-    selected_cities = st.sidebar.multiselect('Select Cities:', options=sorted(filtered_data['CITY'].unique()))
-    if selected_cities:
-        filtered_data = filtered_data[filtered_data['CITY'].isin(selected_cities)]
-
-    # 门店名称筛选器，基于选择的城市动态更新选项
-    if selected_cities:
-        options_stores = sorted(filtered_data[filtered_data['CITY'].isin(selected_cities)]['LIBELLE_y'].unique())
-    else:
-        options_stores = sorted(filtered_data['LIBELLE_y'].unique())
-    selected_stores = st.sidebar.multiselect('Select Stores:', options=options_stores)
-    if selected_stores:
-        filtered_data = filtered_data[filtered_data['LIBELLE_y'].isin(selected_stores)]
-
-    # 检查过滤后的数据是否为空
     if filtered_data.empty:
-        st.write("No data available for the selected filters.")
+        st.info("No data available for the selected filters.")
     else:
-        # 绘制图表
-        grouped = filtered_data.groupby('Date_transaction')['Quantity_item'].sum().reset_index()
-        fig, ax = plt.subplots(figsize=(10, 5))
-        # 绘制数据点和线
-        ax.plot(grouped['Date_transaction'], grouped['Quantity_item'], marker='o', linestyle='-', color='tab:blue')
-        # 设置标题和轴标签
-        ax.set_title('Sales Trend Over Time', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Date', fontsize=12)
-        ax.set_ylabel('Total Quantity Sold', fontsize=12)
-        # 设置 Y 轴的标签为整数
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
-        # 添加网格线
-        #ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        # 自动旋转日期标记以防止重叠
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
-        # 显示图表
-        st.pyplot(fig)
+        render_kpi_summary(highlights)
 
-
-        # filtered_data = filtered_data[filtered_data['CITY'] != 'Online']
-        # Aggregate sales data by location
-        location_data = filtered_data.groupby(['Latitude', 'Longitude', 'CITY'])['Quantity_item'].sum().reset_index()
-
-        # Create a map using Plotly
-        fig_map = px.scatter_mapbox(
-            location_data,
-            lat='Latitude',
-            lon='Longitude',
-            size='Quantity_item',
-            color='Quantity_item',
-            hover_name='CITY',
-            hover_data={
-                'CITY': False,
-                'Quantity_item': True,
-                'Latitude': False,
-                'Longitude': False
-            },
-            size_max=15,
-            zoom=6,
-            mapbox_style='carto-positron',
-    #        color_continuous_scale= "Icefire"
-            color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"]
+        trend = (
+            filtered_data.groupby("Date_transaction")["Quantity_item"].sum().reset_index()
         )
+        if trend.empty:
+            st.info("No trend data to display.")
+        else:
+            fig_trend = px.line(
+                trend,
+                x="Date_transaction",
+                y="Quantity_item",
+                markers=True,
+                title="Sales Trend Over Time",
+                color_discrete_sequence=["#0193A5"],
+            )
+            fig_trend.update_layout(xaxis_title="Date", yaxis_title="Units Sold")
+            st.plotly_chart(fig_trend, use_container_width=True)
 
-        fig_map.update_layout(
-            title='Sales Distribution by Location',
-            mapbox_center={
-                'lat': location_data['Latitude'].mean(),
-                'lon': location_data['Longitude'].mean()
-            },
-            margin={'l': 0, 'r': 0, 't': 30, 'b': 0}
-        )
+        monthly_sales = build_monthly_sales_series(filtered_data)
+        if not monthly_sales.empty:
+            monthly_sales["Month_Label"] = monthly_sales["Month"].dt.strftime("%Y-%m")
+            fig_monthly = px.bar(
+                monthly_sales,
+                x="Month_Label",
+                y="Revenue",
+                hover_data={"Orders": True, "Units": True},
+                title="Monthly Revenue & Volume",
+                color="Revenue",
+                color_continuous_scale=["#0193A5", "#F16744"],
+            )
+            fig_monthly.update_layout(xaxis_title="Month", yaxis_title="Revenue")
+            st.plotly_chart(fig_monthly, use_container_width=True)
 
-        # Display the map in Streamlit
-        st.plotly_chart(fig_map)
+        location_data = filtered_data.dropna(subset=["Latitude", "Longitude"])
+        if not location_data.empty:
+            location_agg = (
+                location_data.groupby(["Latitude", "Longitude", "CITY"], dropna=False)["Quantity_item"].sum().reset_index()
+            )
+            fig_map = px.scatter_mapbox(
+                location_agg,
+                lat="Latitude",
+                lon="Longitude",
+                size="Quantity_item",
+                color="Quantity_item",
+                hover_name="CITY",
+                hover_data={"Quantity_item": True},
+                size_max=18,
+                zoom=5,
+                mapbox_style="carto-positron",
+                color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"],
+                title="Sales Distribution by Location",
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.info("No latitude/longitude data available for the filtered dataset.")
 
-
-
-# filtered_data = data.copy()
-# filtered_data = filtered_data[filtered_data['Quantity_item'] >= 0]
 
 with tabs[1]:
-    # 对 'Unit_original_price' 进行转换
-    filtered_data['Unit_original_price'] = filtered_data['Unit_original_price'].astype(str).str.replace(',', '.').astype(float)
-    filtered_data['Promotion_ID'] = filtered_data['Promotion_ID'].apply(lambda x: 0 if pd.isna(x) else 1)
-    
-    # 计算 'Total_Original_Price'
-    filtered_data = filtered_data.assign(Total_Original_Price=filtered_data['Unit_original_price'] * filtered_data['Quantity_item'])
+    st.header("Customer Insights")
 
-    # 按 'Contact_ID', 'CITY' 分组并汇总数据
-    grouped_data = filtered_data.groupby(['Contact_ID', 'CITY']).agg({
-        'Promotion_ID': 'sum',
-        'Quantity_item': 'sum',
-        'Total_Original_Price': 'sum'
-    }).reset_index()
+    if filtered_data.empty:
+        st.info("No data available for the selected filters.")
+    else:
+        customer_data = filtered_data.copy()
+        grouped_data = customer_data.groupby(["Contact_ID", "CITY"], dropna=False).agg(
+            promotion_touches=("Promo_Flag", "sum"),
+            quantity=("Quantity_item", "sum"),
+            total_sales=("Line_Sales_Value", "sum"),
+            total_original=("Line_Original_Value", "sum"),
+        ).reset_index()
 
-    # 计算 'Unit_price'
-    grouped_data['Unit_price'] = grouped_data['Total_Original_Price'] / grouped_data['Quantity_item']
+        grouped_data["Unit_price"] = grouped_data["total_sales"] / grouped_data["quantity"].replace(0, np.nan)
+        grouped_data = grouped_data.replace([np.inf, -np.inf], np.nan).dropna(subset=["Unit_price"])
 
+        if grouped_data.empty:
+            st.info("Not enough customer data to build the view.")
+        else:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.boxplot(grouped_data["Unit_price"], showfliers=False)
+            ax.set_title("Distribution of Customer Unit Price")
+            ax.set_ylabel("Unit Price")
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
 
-    # 绘制盒须图
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.boxplot(grouped_data['Unit_price'], showfliers=False)  # 不显示离群点
-    ax.set_title('Boxplot of Unit Price')
-    ax.set_ylabel('Unit Price')
-    ax.set_ylim(0, 100)  # 设置y轴的上限为100
-    ax.grid(True)  # 添加网格线
-    st.pyplot(fig)
+            quantiles = grouped_data["Unit_price"].quantile([0.25, 0.5, 0.75]).rename({0.25: "25%", 0.5: "50%", 0.75: "75%"})
+            st.subheader("Customer Value Quantiles")
+            st.dataframe(quantiles.to_frame(name="Unit Price"))
 
-    quantiles = grouped_data['Unit_price'].quantile([0.25, 0.50, 0.75])
-    st.write("Quantiles:", quantiles)
+            boundaries = [grouped_data["Unit_price"].min(), quantiles.loc["25%"], quantiles.loc["75%"], grouped_data["Unit_price"].max()]
+            labels = ["Low Value", "Medium Value", "High Value"]
+            grouped_data["Customer_Category"] = pd.cut(
+                grouped_data["Unit_price"],
+                bins=boundaries,
+                labels=labels,
+                include_lowest=True,
+                duplicates="drop",
+            )
 
-    # 设置分割点以包含所有数据
-    boundaries = [grouped_data['Unit_price'].min(), quantiles[0.25], quantiles[0.75], grouped_data['Unit_price'].max()]
-    labels = ['Low Value Customer', 'Medium Value Customer', 'High Value Customer']
+            grouped_data["Promotion_Used"] = np.where(grouped_data["promotion_touches"] > 0, "Used Promotion", "No Promotion")
+            category_promotion_counts = pd.crosstab(grouped_data["Customer_Category"], grouped_data["Promotion_Used"])
 
-    # 使用 cut 函数创建新的分类列
-    grouped_data['Customer_Category'] = pd.cut(grouped_data['Unit_price'], bins=boundaries, labels=labels, include_lowest=True)
+            st.subheader("Promotion Usage by Customer Value")
+            st.dataframe(category_promotion_counts)
 
-    # 统计每个客户类别下的 Promotion_ID 出现频次
-    category_promotion_counts = grouped_data.groupby(['Customer_Category']).agg({
-        'Promotion_ID': ['sum', 'count']
-    })
-    category_promotion_counts.columns = ['Used Promotion', 'No Promotion']
+            if category_promotion_counts.shape[1] == 2:
+                chi2, p_value, dof, _ = chi2_contingency(category_promotion_counts)
+                st.caption(f"Chi-squared statistic: {chi2:.2f} (p-value = {p_value:.4f}, dof = {dof})")
+            else:
+                st.caption("Not enough variation to run a chi-squared test on promotion usage.")
 
-    # 在 Streamlit 中显示统计数据
-    st.table(category_promotion_counts)
-
-    # 执行卡方检验
-    chi2, p_value, dof, expected = chi2_contingency([category_promotion_counts['Used Promotion'], category_promotion_counts['No Promotion']])
-
-    # 在 Streamlit 中打印结果
-    st.write("Chi-squared Test Statistic:", chi2)
-    st.write("p-value:", p_value)
-    st.write("Degrees of freedom:", dof)
-    # st.write("Expected frequencies:", expected)
-
-    # 在 Streamlit 中显示前几行数据
-    st.write("Grouped Data:", filtered_data.head())
+            top_customers = (
+                grouped_data.sort_values("total_sales", ascending=False)
+                .head(10)
+                .loc[:, ["Contact_ID", "CITY", "total_sales", "quantity", "promotion_touches"]]
+            )
+            top_customers.rename(
+                columns={
+                    "total_sales": "Sales",
+                    "quantity": "Units",
+                    "promotion_touches": "Promotion Touches",
+                },
+                inplace=True,
+            )
+            st.subheader("Top Customers by Sales")
+            st.dataframe(top_customers)
 
 
 with tabs[2]:
-    # 对 'Transaction_value' 进行数据转换
-    # 检查过滤后的数据是否为空
-    if filtered_data.empty:
-        st.write("No data available for the selected filters.")
+    st.header("Transaction Value")
+
+    if transaction_level.empty:
+        st.info("No transaction data for the selected filters.")
     else:
-        # 对 'Transaction_value' 进行数据转换
-        filtered_data['Transaction_value'] = filtered_data['Transaction_value'].astype(str).str.replace(',', '.').astype(float)
+        positive_transactions = transaction_level[transaction_level["Transaction_value"] >= 0]
+        avg_transaction_value = positive_transactions["Transaction_value"].mean()
+        st.metric("Average Transaction Value", format_currency(avg_transaction_value))
 
-        # 去除重复的交易 ID 并筛选出大于等于0的交易值
-        unique_transaction_values = filtered_data.drop_duplicates(subset='Transaction_ID', keep='first')
-        unique_transaction_values = unique_transaction_values[unique_transaction_values['Transaction_value'] >= 0]
+        bin_width = st.slider("Histogram bin width", min_value=5, max_value=100, value=20, step=5)
+        data_min = float(positive_transactions["Transaction_value"].min())
+        data_max = float(positive_transactions["Transaction_value"].max())
+        bins = np.arange(start=data_min, stop=data_max + bin_width, step=bin_width)
 
-        # 定义bin的宽度和X轴的最大边界
-        bin_width = 20
-        x_max = 400
-
-        # 计算bin的边界
-        data_min = unique_transaction_values['Transaction_value'].min()
-        # 确保bin的最大边界不超过设定的x_max
-        bin_edges = np.arange(start=data_min, stop=min(unique_transaction_values['Transaction_value'].max(), x_max) + bin_width, step=bin_width)
-
-        # 创建直方图
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(unique_transaction_values['Transaction_value'], bins=bin_edges, color='#0193A5', edgecolor='#004A59', alpha=0.7)
-
-        # 设置标题和轴标签
-        ax.set_title('Distribution of Transaction Values')
-        ax.set_xlabel('Transaction Value')
-        ax.set_ylabel('Frequency')
-
-        # 设置X轴刻度，使用bin的边界
-        ax.set_xticks(bin_edges)
-        ax.set_xticklabels([f'{edge:.0f}' for edge in bin_edges], rotation=90)  # 旋转标签以更好地显示
-
-        # 设置X轴的显示范围到400
-        ax.set_xlim([data_min, x_max])
-
-        # 在 Streamlit 中显示图形
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.hist(positive_transactions["Transaction_value"], bins=bins, color="#0193A5", edgecolor="#004A59", alpha=0.75)
+        ax.set_title("Distribution of Transaction Values")
+        ax.set_xlabel("Transaction Value")
+        ax.set_ylabel("Frequency")
+        ax.grid(True, axis="y", alpha=0.3)
         st.pyplot(fig)
 
-
-    # 检查过滤后的数据是否为空
-    if filtered_data.empty:
-        st.write("No data available for the selected filters.")
-    else:
-        # filtered_data = filtered_data[filtered_data['CITY'] != 'Online']
-        # Aggregate sales data by location
-        location_data = unique_transaction_values.groupby(['Latitude', 'Longitude', 'CITY'])['Transaction_value'].mean().reset_index()
-
-        # Create a map using Plotly
-        fig_map = px.scatter_mapbox(
-            location_data,
-            lat='Latitude',
-            lon='Longitude',
-            size='Transaction_value',
-            color='Transaction_value',
-            hover_name='CITY',
-            hover_data={
-                'CITY': False,
-                'Transaction_value': True,
-                'Latitude': False,
-                'Longitude': False
-            },
-            size_max=15,
-            zoom=6,
-            mapbox_style='carto-positron',
-    #        color_continuous_scale= "Icefire"
-            color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"]
-        )
-
-        fig_map.update_layout(
-            title='Transaction Value by Location',
-            mapbox_center={
-                'lat': location_data['Latitude'].mean(),
-                'lon': location_data['Longitude'].mean()
-            },
-            margin={'l': 0, 'r': 0, 't': 30, 'b': 0}
-        )
-
-        # Display the map in Streamlit
-        st.plotly_chart(fig_map)
-
-
-
-
+        location_transactions = transaction_level.dropna(subset=["Latitude", "Longitude"])
+        if not location_transactions.empty:
+            location_avg = (
+                location_transactions.groupby(["Latitude", "Longitude", "CITY"], dropna=False)["Transaction_value"].mean().reset_index()
+            )
+            fig_map = px.scatter_mapbox(
+                location_avg,
+                lat="Latitude",
+                lon="Longitude",
+                size="Transaction_value",
+                color="Transaction_value",
+                hover_name="CITY",
+                size_max=18,
+                mapbox_style="carto-positron",
+                color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"],
+                title="Average Transaction Value by Location",
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.info("No geo-tagged transactions available for the current filters.")
 
 
 with tabs[3]:
+    st.header("RFM Analysis")
 
-    # 检查过滤后的数据是否为空
-    if filtered_data.empty:
-        st.write("No data available for the selected filters.")
+    if transaction_level.empty:
+        st.info("No transaction data for the selected filters.")
     else:
-        # 提取 RFM 相关列
-        rfm_data = unique_transaction_values[['Transaction_ID', 'Contact_ID', 'Date_transaction', 'Transaction_value', 'Latitude', 'Longitude', 'CITY']]
+        rfm_data = transaction_level[["Transaction_ID", "Contact_ID", "Date_transaction", "Transaction_value", "CITY", "Latitude", "Longitude"]].dropna(subset=["Contact_ID"])
 
-        # 计算 RFM 指标
-        current_date = rfm_data['Date_transaction'].max() + pd.Timedelta(days=1)
-        rfm = rfm_data.groupby('Contact_ID').agg({
-            'Date_transaction': lambda x: (current_date - x.max()).days,  # Recency: Days since last purchase
-            'Transaction_ID': 'count',  # Frequency: Number of transactions
-            'Transaction_value': 'sum',  # Monetary: Total money spent
-            'Latitude': 'first',  # 取每个 Contact_ID 的第一条记录的 Latitude
-            'Longitude': 'first',  # 取每个 Contact_ID 的第一条记录的 Longitude
-            'CITY': 'first'  # 取每个 Contact_ID 的第一条记录的 CITY
-        }).rename(columns={
-            'Date_transaction': 'Recency',
-            'Transaction_ID': 'Frequency',
-            'Transaction_value': 'Monetary'
-        })
+        current_date = rfm_data["Date_transaction"].max() + pd.Timedelta(days=1)
+        rfm = rfm_data.groupby("Contact_ID").agg(
+            Recency=("Date_transaction", lambda x: (current_date - x.max()).days),
+            Frequency=("Transaction_ID", "count"),
+            Monetary=("Transaction_value", "sum"),
+            Latitude=("Latitude", "first"),
+            Longitude=("Longitude", "first"),
+            CITY=("CITY", "first"),
+        )
 
-        # 给 Recency, Frequency, 和 Monetary 分配分数
-        rfm['R_Score'] = pd.qcut(rfm['Recency'], 5, labels=[5, 4, 3, 2, 1], duplicates='drop')  # 更近的购买得分更高
-        rfm['F_Score'] = pd.cut(rfm['Frequency'], bins=[0, 1, 2, 4, 7, rfm['Frequency'].max()], labels=[1, 2, 3, 4, 5], right=True)
-        rfm['M_Score'] = pd.qcut(rfm['Monetary'], 5, labels=[1, 2, 3, 4, 5], duplicates='drop')  # 金钱花费更高得分也更高
+        rfm["R_Score"] = quantile_rank_score(rfm["Recency"], reverse=True)
+        rfm["F_Score"] = quantile_rank_score(rfm["Frequency"])
+        rfm["M_Score"] = quantile_rank_score(rfm["Monetary"])
+        rfm["RFM_Score"] = rfm[["R_Score", "F_Score", "M_Score"]].sum(axis=1)
 
-        # 重新计算总 RFM 得分
-        rfm['RFM_Score'] = rfm['R_Score'].astype(int) + rfm['F_Score'].astype(int) + rfm['M_Score'].astype(int)
-
-        # 在 Streamlit 中显示 RFM 数据的头几行，去除 Latitude 和 Longitude 列
-        # st.write("RFM Table:", rfm.drop(columns=['Latitude', 'Longitude']))
-
-        # 绘制 RFM 分数的分布直方图
-        fig, ax = plt.subplots(figsize=(10, 6))
-        rfm['RFM_Score'].hist(bins=range(rfm['RFM_Score'].min(), rfm['RFM_Score'].max() + 2), color='#0193A5', edgecolor='#004A59', align='left')
-        ax.set_title('Distribution of RFM Scores')
-        ax.set_xlabel('RFM Score')
-        ax.set_ylabel('Number of Customers')
-        ax.set_xticks(range(rfm['RFM_Score'].min(), rfm['RFM_Score'].max() + 1))  # 设置 X 轴的刻度，显示每个得分
+        fig, ax = plt.subplots(figsize=(10, 5))
+        rfm["RFM_Score"].hist(
+            bins=range(rfm["RFM_Score"].min(), rfm["RFM_Score"].max() + 2),
+            color="#0193A5",
+            edgecolor="#004A59",
+            align="left",
+        )
+        ax.set_title("Distribution of RFM Scores")
+        ax.set_xlabel("RFM Score")
+        ax.set_ylabel("Number of Customers")
+        ax.set_xticks(range(rfm["RFM_Score"].min(), rfm["RFM_Score"].max() + 1))
         ax.grid(False)
         st.pyplot(fig)
 
+        rfm["Segment"] = pd.cut(
+            rfm["RFM_Score"],
+            bins=[rfm["RFM_Score"].min() - 1, 6, 9, 12, rfm["RFM_Score"].max()],
+            labels=["At Risk", "Growth", "Loyal", "Champions"],
+        )
+        segment_summary = rfm.groupby("Segment").agg(
+            Customers=("RFM_Score", "count"),
+            Avg_R=("R_Score", "mean"),
+            Avg_F=("F_Score", "mean"),
+            Avg_M=("M_Score", "mean"),
+            Revenue=("Monetary", "sum"),
+        )
+        st.subheader("RFM Segment Summary")
+        st.dataframe(segment_summary)
 
-    # 检查过滤后的数据是否为空
+        geo_rfm = rfm.dropna(subset=["Latitude", "Longitude"]).groupby(["Latitude", "Longitude", "CITY"], dropna=False)["RFM_Score"].mean().reset_index()
+        if not geo_rfm.empty:
+            fig_map = px.scatter_mapbox(
+                geo_rfm,
+                lat="Latitude",
+                lon="Longitude",
+                size="RFM_Score",
+                color="RFM_Score",
+                hover_name="CITY",
+                size_max=18,
+                zoom=5,
+                mapbox_style="carto-positron",
+                color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"],
+                title="Average RFM Score by Location",
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.info("No geospatial data to display RFM scores by location.")
+
+
+with tabs[4]:
+    st.header("Promotion Impact")
+
     if filtered_data.empty:
-        st.write("No data available for the selected filters.")
+        st.info("No data available for the selected filters.")
     else:
-        # filtered_data = filtered_data[filtered_data['CITY'] != 'Online']
-        # Aggregate sales data by location
-        location_data = rfm[rfm['CITY'] != 'Online']
-        location_data = location_data.groupby(['Latitude', 'Longitude', 'CITY'])['RFM_Score'].mean().reset_index()
+        promotion_summary = build_promotion_summary(filtered_data)
+        if promotion_summary.empty:
+            st.info("Not enough promotion data to compare performance.")
+        else:
+            st.subheader("Promotion vs Non-Promotion Performance")
+            display_summary = promotion_summary.copy()
+            display_summary["revenue"] = display_summary["revenue"].apply(format_currency)
+            display_summary["avg_order_value"] = display_summary["avg_order_value"].apply(format_currency)
+            display_summary["total_discount"] = display_summary["total_discount"].apply(format_currency)
+            display_summary["avg_discount_per_order"] = display_summary["avg_discount_per_order"].apply(format_currency)
+            st.dataframe(display_summary)
 
-        # Create a map using Plotly
-        fig_map = px.scatter_mapbox(
-            location_data,
-            lat='Latitude',
-            lon='Longitude',
-            size='RFM_Score',
-            color='RFM_Score',
-            hover_name='CITY',
-            hover_data={
-                'CITY': False,
-                'RFM_Score': True,
-                'Latitude': False,
-                'Longitude': False
-            },
-            size_max=15,
-            zoom=6,
-            mapbox_style='carto-positron',
-    #        color_continuous_scale= "Icefire"
-            color_continuous_scale=["#0193A5", "#027184", "#004A59", "#C73618", "#F16744", "#F6A278"]
+            promo_chart = promotion_summary.reset_index().rename(columns={"index": "Promotion"})
+            promo_chart["Promotion"] = promo_chart["Promotion"].replace({"With Promotion": "With Promotion", "No Promotion": "No Promotion"})
+            fig_bar = px.bar(
+                promo_chart,
+                x="Promotion",
+                y="revenue",
+                color="Promotion",
+                text="orders",
+                title="Revenue & Orders by Promotion Flag",
+                color_discrete_sequence=["#004A59", "#F16744"],
+            )
+            fig_bar.update_traces(texttemplate="Orders: %{text}", textposition="outside")
+            fig_bar.update_layout(yaxis_title="Revenue", showlegend=False)
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        top_promotions = (
+            filtered_data.dropna(subset=["Promotion_ID"])
+            .groupby("Promotion_ID")
+            .agg(
+                revenue=("Transaction_value", "sum"),
+                orders=("Transaction_ID", "nunique"),
+                units=("Quantity_item", "sum"),
+            )
+            .sort_values("revenue", ascending=False)
+            .head(10)
         )
+        if not top_promotions.empty:
+            st.subheader("Top Promotions by Revenue")
+            top_promotions_table = top_promotions.copy()
+            top_promotions_table["revenue"] = top_promotions_table["revenue"].apply(format_currency)
+            st.dataframe(top_promotions_table)
 
-        fig_map.update_layout(
-            title='Transaction Value by Location',
-            mapbox_center={
-                'lat': location_data['Latitude'].mean(),
-                'lon': location_data['Longitude'].mean()
-            },
-            margin={'l': 0, 'r': 0, 't': 30, 'b': 0}
-        )
+        store_profitability = build_profitability_by_store(filtered_data).head(10)
+        if not store_profitability.empty:
+            st.subheader("Store Performance Snapshot")
+            store_table = store_profitability.reset_index()
+            store_table["revenue"] = store_table["revenue"].apply(format_currency)
+            store_table["discount"] = store_table["discount"].apply(format_currency)
+            st.dataframe(store_table.rename(columns={"LIBELLE_y": "Store", "CITY": "City"}))
 
-        # Display the map in Streamlit
-        st.plotly_chart(fig_map)
+
+with tabs[5]:
+    st.header("Retention Cohorts")
+
+    retention_matrix, cohort_sizes = build_cohort_retention(filtered_data)
+
+    if retention_matrix.empty:
+        st.info("Not enough sequential purchases to build a cohort matrix for the selected filters.")
+    else:
+        cohort_display = retention_matrix.copy()
+        cohort_display = cohort_display.applymap(lambda x: f"{x:.0%}")
+        st.subheader("Monthly Retention by Cohort (percentage of customers retained)")
+        st.dataframe(cohort_display)
+
+        retention_line = retention_matrix.reset_index().melt(id_vars="CohortMonth", var_name="Months Since First Purchase", value_name="Retention")
+        retention_line = retention_line[retention_line["Months Since First Purchase"] <= 6]
+        if not retention_line.empty:
+            fig_retention = px.line(
+                retention_line,
+                x="Months Since First Purchase",
+                y="Retention",
+                color="CohortMonth",
+                title="Retention Trend for First Six Months",
+                markers=True,
+            )
+            fig_retention.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig_retention, use_container_width=True)
+
+        st.caption("Cohort size denotes the number of distinct customers making their first purchase in that month.")
+        cohort_sizes_display = cohort_sizes.to_frame(name="Customers")
+        st.dataframe(cohort_sizes_display)
+
+
+with tabs[6]:
+    st.header("Data Quality & Notes")
+
+    st.subheader("Filter Summary")
+    summary_lines = []
+    for key, values in selections.items():
+        if not values:
+            continue
+        summary_lines.append(f"**{key.capitalize()}**: {', '.join(str(v) for v in values)}")
+    if summary_lines:
+        st.markdown("\n".join(f"- {line}" for line in summary_lines))
+    else:
+        st.markdown("- Using the full dataset (no filters applied).")
+
+    quality_columns = [
+        "Transaction_ID",
+        "Contact_ID",
+        "Promotion_ID",
+        "Transaction_value",
+        "Quantity_item",
+        "Latitude",
+        "Longitude",
+        "CITY",
+        "Catégorie",
+    ]
+
+    quality_report = generate_data_quality_report(filtered_data, quality_columns)
+    if quality_report.empty:
+        st.info("No data quality metrics available for the current selection.")
+    else:
+        report_display = quality_report.copy()
+        report_display["missing_pct"] = report_display["missing_pct"].map(lambda x: f"{x:.2f}%")
+        st.subheader("Missing Data Overview")
+        st.dataframe(report_display)
+
+    st.subheader("Analyst Notes")
+    st.markdown(
+        """
+        - Promotion impact and cohort retention views rely on sufficient historical coverage. Filters that isolate a narrow window may reduce interpretability.
+        - Coordinates are missing for some stores (notably online channels); these are excluded from map-based visuals.
+        - Consider exporting filtered data for deeper modelling via `st.dataframe(filtered_data.head())` or downloading with Streamlit's download buttons.
+        """
+    )
