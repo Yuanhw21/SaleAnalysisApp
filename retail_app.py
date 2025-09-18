@@ -5,7 +5,7 @@ import streamlit as st
 import plotly.express as px
 from scipy.stats import chi2_contingency
 
-from data_pipeline import (
+from src.data_pipeline import (
     load_and_prepare_data,
     compute_highlights,
     generate_data_quality_report,
@@ -13,6 +13,7 @@ from data_pipeline import (
     build_profitability_by_store,
     build_monthly_sales_series,
     build_cohort_retention,
+    list_available_months,
 )
 
 
@@ -57,8 +58,8 @@ def format_percent(value: float) -> str:
 
 
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    return load_and_prepare_data()
+def load_data(months: tuple[str, ...]) -> pd.DataFrame:
+    return load_and_prepare_data(months=months)
 
 
 def apply_sidebar_filters(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -170,10 +171,35 @@ def render_kpi_summary(highlights: dict) -> None:
         st.markdown("\n".join(f"- {line}" for line in narrative_lines))
 
 
-data = load_data()
+available_months = list_available_months()
+if not available_months:
+    st.error("No sales extracts found under the data directory.")
+    st.stop()
+
+def _format_month(token: str) -> str:
+    if len(token) == 6:
+        return f"{token[:4]}-{token[4:]}"
+    return token
+
+default_month_selection = list(available_months)
+selected_months = st.sidebar.multiselect(
+    "Sales Months",
+    options=available_months,
+    default=default_month_selection,
+    format_func=_format_month,
+)
+
+if not selected_months:
+    st.sidebar.error("Select at least one month to populate the dashboard.")
+    st.stop()
+
+selected_months = tuple(sorted(selected_months))
+
+data = load_data(selected_months)
 
 filtered_data = data[data["Quantity_item"] >= 0].copy()
 filtered_data, selections = apply_sidebar_filters(filtered_data)
+selections["months_loaded"] = [_format_month(token) for token in selected_months]
 
 transaction_level = (
     filtered_data.drop_duplicates(subset="Transaction_ID") if not filtered_data.empty else pd.DataFrame()
@@ -227,10 +253,19 @@ with tabs[0]:
                 y="Revenue",
                 hover_data={"Orders": True, "Units": True},
                 title="Monthly Revenue & Volume",
-                color="Revenue",
-                color_continuous_scale=["#0193A5", "#F16744"],
+                color_discrete_sequence=["#0193A5"],
             )
-            fig_monthly.update_layout(xaxis_title="Month", yaxis_title="Revenue")
+            fig_monthly.update_xaxes(type="category", title="Month")
+            fig_monthly.update_yaxes(title="Revenue")
+            fig_monthly.update_traces(
+                text=monthly_sales["Orders"],
+                texttemplate="Orders: %{text:,}",
+                textposition="outside",
+                marker_line_color="#004A59",
+                marker_line_width=0.5,
+            )
+            if len(monthly_sales) == 1:
+                st.caption("Only one month of data is available for the selected filters.")
             st.plotly_chart(fig_monthly, use_container_width=True)
 
         location_data = filtered_data.dropna(subset=["Latitude", "Longitude"])
@@ -414,7 +449,7 @@ with tabs[3]:
             bins=[rfm["RFM_Score"].min() - 1, 6, 9, 12, rfm["RFM_Score"].max()],
             labels=["At Risk", "Growth", "Loyal", "Champions"],
         )
-        segment_summary = rfm.groupby("Segment").agg(
+        segment_summary = rfm.groupby("Segment", observed=False).agg(
             Customers=("RFM_Score", "count"),
             Avg_R=("R_Score", "mean"),
             Avg_F=("F_Score", "mean"),
@@ -462,20 +497,68 @@ with tabs[4]:
             display_summary["avg_discount_per_order"] = display_summary["avg_discount_per_order"].apply(format_currency)
             st.dataframe(display_summary)
 
-            promo_chart = promotion_summary.reset_index().rename(columns={"index": "Promotion"})
-            promo_chart["Promotion"] = promo_chart["Promotion"].replace({"With Promotion": "With Promotion", "No Promotion": "No Promotion"})
-            fig_bar = px.bar(
-                promo_chart,
-                x="Promotion",
-                y="revenue",
-                color="Promotion",
-                text="orders",
-                title="Revenue & Orders by Promotion Flag",
+            promo_chart = promotion_summary.reset_index()
+            promo_label_col = promo_chart.columns[0]
+            if promo_label_col != "Promotion":
+                promo_chart.rename(columns={promo_label_col: "Promotion"}, inplace=True)
+            revenue_total = promo_chart["revenue"].sum()
+            orders_total = promo_chart["orders"].sum()
+
+            share_chart = promo_chart[["Promotion", "revenue", "orders"]].copy()
+            if revenue_total:
+                share_chart["Revenue Share"] = share_chart["revenue"] / revenue_total
+            else:
+                share_chart["Revenue Share"] = 0
+            if orders_total:
+                share_chart["Order Share"] = share_chart["orders"] / orders_total
+            else:
+                share_chart["Order Share"] = 0
+
+            share_long = share_chart.melt(
+                id_vars="Promotion",
+                value_vars=["Revenue Share", "Order Share"],
+                var_name="Metric",
+                value_name="Share",
+            )
+
+            fig_share = px.bar(
+                share_long,
+                x="Share",
+                y="Promotion",
+                color="Metric",
+                orientation="h",
+                barmode="group",
+                text="Share",
+                title="Promotion Contribution to Revenue and Orders",
                 color_discrete_sequence=["#004A59", "#F16744"],
             )
-            fig_bar.update_traces(texttemplate="Orders: %{text}", textposition="outside")
-            fig_bar.update_layout(yaxis_title="Revenue", showlegend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            fig_share.update_traces(texttemplate="%{text:.1%}", textposition="outside", textfont=dict(color="#2c3e50"))
+            fig_share.update_layout(
+                xaxis_tickformat=".0%",
+                legend_title="",
+                font=dict(color="#2c3e50"),
+                bargap=0.35,
+                yaxis_title="Promotion Flag",
+            )
+            st.plotly_chart(fig_share, use_container_width=True)
+
+            aov_labels = promo_chart["avg_order_value"].apply(format_currency)
+            fig_aov = px.bar(
+                promo_chart,
+                x="Promotion",
+                y="avg_order_value",
+                color="Promotion",
+                text=aov_labels,
+                title="Average Order Value by Promotion Flag",
+                color_discrete_sequence=["#004A59", "#F16744"],
+            )
+            fig_aov.update_traces(textposition="outside", textfont=dict(color="#2c3e50"))
+            fig_aov.update_layout(
+                yaxis_title="Average Order Value",
+                showlegend=False,
+                font=dict(color="#2c3e50"),
+            )
+            st.plotly_chart(fig_aov, use_container_width=True)
 
         top_promotions = (
             filtered_data.dropna(subset=["Promotion_ID"])
